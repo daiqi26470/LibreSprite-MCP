@@ -45,9 +45,11 @@ class LibrespriteProxy:
             """Get the current script."""
             if self._script is None:
                 self._script_event.wait()
-                self._script_event.clear()
             script = self._script
             self._script = None
+            # Clear the event *after* consuming the script, otherwise the next
+            # GET returns immediately with a null script (stale wakeup).
+            self._script_event.clear()
             return jsonify({"script": script})
 
         @self.app.post('/')

@@ -3,7 +3,13 @@
  */
 
 // Cache the global context.
-const global = this;
+// NOTE: LibreSprite's Duktape script host evaluates the top-level script with a
+// `this` binding of `undefined`, so fall back to other ways of reaching the
+// global object (sloppy-mode function `this` returns the global object).
+const global = (typeof globalThis !== 'undefined' && globalThis) ||
+    (typeof self !== 'undefined' && self) ||
+    (typeof window !== 'undefined' && window) ||
+    (function () { return this; })();
 
 /**
  * Model Context Protocol (MCP) remote script that interacts with the libresprite-mcp server.
@@ -79,10 +85,11 @@ const global = this;
     /**
      * Global `console.log`.
      */
-    const _clientLogger = global.console.log;
+    const _baseConsole = (global && global.console) || {};
+    const _clientLogger = _baseConsole.log || function () {};
 
     // Override global console object to capture stdout.
-    const console = Object.assign({}, global.console);
+    const console = Object.assign({}, _baseConsole);
 
     /**
      * Modified `console.log` that captures output before logging.
@@ -90,8 +97,8 @@ const global = this;
     console.log = function() {
         var args = Array.prototype.slice.call(arguments);
         output += args.join(' ') + '\n';
-        _clientLogger.apply(null, args);
-    }
+        _clientLogger.apply(_baseConsole, args);
+    };
 
     /**
      * Makes a GET request.
@@ -173,6 +180,22 @@ const global = this;
     }
 
     /**
+     * Schedules an event dispatch.
+     *
+     * NOTE: `app.yield(event, delay)` only resolves a Promise in some
+     * LibreSprite builds instead of raising an event, so dispatch the event
+     * ourselves with setTimeout to keep the retry / polling loop alive.
+     *
+     * @param {string} event - event name
+     * @param {number} [delay] - delay in milliseconds
+     */
+    function schedule(event, delay) {
+        setTimeout(function () {
+            onEvent(event);
+        }, delay || 0);
+    }
+
+    /**
      * Pings for server health.
      *
      * This yields a "bad_health" event if the server is unreachable,
@@ -182,15 +205,15 @@ const global = this;
         get(RELAY_SERVER_URL + '/ping', function(data, error) {
             if (error) {
                 connected = false;
-                app.yield("bad_health", POLL_DELAY);
+                schedule("bad_health", POLL_DELAY);
                 return;
             }
             if (data && data.status === 'pong') {
                 connected = true;
-                app.yield("good_health");
+                schedule("good_health");
             } else {
                 connected = false;
-                app.yield("bad_health", POLL_DELAY);
+                schedule("bad_health", POLL_DELAY);
             }
 
         });
@@ -223,7 +246,7 @@ const global = this;
                 _clientLogger('The MCP server was shut down.');
                 connected = false;
                 paintUI();
-                app.yield("bad_health", POLL_DELAY);
+                schedule("bad_health", POLL_DELAY);
                 return;
             }
             if ( !data ) {
@@ -237,7 +260,7 @@ const global = this;
             if (!polling) {
                 return;
             }
-            app.yield("poll", POLL_DELAY);
+            schedule("poll", POLL_DELAY);
         });
     }
 
@@ -266,6 +289,14 @@ const global = this;
     function exec() {
         if (!polling) return;
         getScript(script => {
+            if (!script) {
+                // A null script means the relay had nothing to hand out
+                // (e.g. a stale wakeup); just poll again instead of running
+                // an empty script and posting an empty output, which would
+                // be mistaken for the result of an in-flight tool call.
+                schedule("poll", POLL_DELAY);
+                return;
+            }
             output = ''; // sanity reset
             runScript(script);
             postOutput();
@@ -398,5 +429,8 @@ const global = this;
                 break;
         }
     }
-    global.onEvent = onEvent;
+    // Register the event handler on the global object so the script host can call it.
+    if (global) {
+        global.onEvent = onEvent;
+    }
 })();
